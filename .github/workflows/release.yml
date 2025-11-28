@@ -1,0 +1,173 @@
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            name: macOS arm64
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            name: macOS Intel
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout private repo
+        uses: actions/checkout@v5
+        with:
+          repository: kirafuw/meowtalk
+          token: ${{ secrets.GH_TOKEN_FOR_CHECKOUT }}
+          ref: ${{ github.event.client_payload.sha }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun store
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ contains(matrix.args, 'aarch64') && 'aarch64-apple-darwin' || 'x86_64-apple-darwin' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "v__VERSION__"
+          releaseBody: "See the assets to download and install."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  update-json:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout releases repo
+        uses: actions/checkout@v5
+
+      - name: Get latest release info
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          GH_REPO="${GITHUB_REPOSITORY}"
+          RELEASE=$(gh api "repos/${GH_REPO}/releases" --paginate --jq '[.[] | select(.draft == true)] | sort_by(.created_at) | last // empty')
+          if [[ -z "$RELEASE" || "$RELEASE" == "null" ]]; then
+            echo "未找到 draft release" >&2
+            exit 1
+          fi
+          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
+          if [[ -z "$TAG" || "$TAG" == "null" ]]; then
+            echo "draft release 缺少 tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download signatures
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=${{ steps.release.outputs.tag }}
+          mkdir -p sigs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.sig" --dir sigs --clobber
+
+          ARM_SIG_FILE=$(ls sigs/*aarch64*.sig 2>/dev/null | head -n 1 || true)
+          X64_SIG_FILE=$(ls sigs/*x64*.sig 2>/dev/null | head -n 1 || true)
+
+          if [[ -z "$ARM_SIG_FILE" || -z "$X64_SIG_FILE" ]]; then
+            echo "签名文件缺失，现有文件：" >&2
+            ls -al sigs >&2
+            exit 1
+          fi
+
+      - name: Generate latest.json
+        run: |
+          set -euo pipefail
+          TAG=${{ steps.release.outputs.tag }}
+          VERSION=${{ steps.release.outputs.version }}
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          MAC_ARM_SIG=$(tr -d '\n' < sigs/*aarch64*.sig)
+          MAC_X64_SIG=$(tr -d '\n' < sigs/*x64*.sig)
+
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "Release $VERSION",
+            "pub_date": "$DATE",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$MAC_ARM_SIG",
+                "url": "https://github.com/kirafuw/meowtalk-releases/releases/download/$TAG/meowtalk_aarch64.app.tar.gz"
+              },
+              "darwin-x86_64": {
+                "signature": "$MAC_X64_SIG",
+                "url": "https://github.com/kirafuw/meowtalk-releases/releases/download/$TAG/meowtalk_x64.app.tar.gz"
+              }
+            }
+          }
+          EOF
+
+          jq -e '
+            .version
+            and .platforms["darwin-aarch64"].signature != ""
+            and .platforms["darwin-x86_64"].signature != ""
+            and (.platforms["darwin-aarch64"].url | test("^https://"))
+            and (.platforms["darwin-x86_64"].url | test("^https://"))
+          ' latest.json >/dev/null
+
+      - name: Show latest.json
+        run: cat latest.json
+
+      - name: Commit latest.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --stat latest.json || true
+          git add latest.json
+          git commit -m "Update latest.json to ${{ steps.release.outputs.tag }}" || echo "No changes"
+          git push
